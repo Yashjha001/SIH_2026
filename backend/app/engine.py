@@ -23,11 +23,11 @@ def impact_for(profile: UserProfile, weather: Weather) -> Impact:
     outdoor = persona in {Persona.FITNESS, Persona.FAMILY, Persona.OUTDOOR_WORKER, Persona.EVENT}
     heat = 25 if weather.feels_like >= 42 and outdoor else 18 if weather.feels_like >= 36 and outdoor else 6
     uv = 18 if weather.uv_index >= 8 and outdoor else 8 if weather.uv_index >= 6 else 2
-    rain_weight = 16 if persona in {Persona.COMMUTER, Persona.TRAVEL, Persona.FAMILY, Persona.AGRICULTURE} else 8
+    rain_weight = 16 if persona in {Persona.COMMUTER, Persona.TRAVEL, Persona.FAMILY} else 6 if persona == Persona.AGRICULTURE else 5
     rain = rain_weight if weather.rain_probability >= 60 else 4
-    wind = 14 if weather.wind_speed >= 25 and persona in {Persona.FITNESS, Persona.OUTDOOR_WORKER, Persona.EVENT, Persona.AGRICULTURE} else 5
-    air = 18 if (weather.aqi or 0) >= 200 else 10 if (weather.aqi or 0) >= 120 else 2
-    context = {Persona.OUTDOOR_WORKER: 22, Persona.FITNESS: 18, Persona.FAMILY: 12, Persona.COMMUTER: 14, Persona.TRAVEL: 10, Persona.AGRICULTURE: 8}.get(persona, 6)
+    wind = 10 if weather.wind_speed >= 25 and persona == Persona.FITNESS else 8 if weather.wind_speed >= 25 and persona in {Persona.OUTDOOR_WORKER, Persona.EVENT, Persona.AGRICULTURE} else 5
+    air = 18 if (weather.aqi or 0) >= 200 and persona in {Persona.HEALTH, Persona.OUTDOOR_WORKER} else 10 if (weather.aqi or 0) >= 120 else 2
+    context = {Persona.OUTDOOR_WORKER: 22, Persona.FITNESS: 12, Persona.FAMILY: 12, Persona.COMMUTER: 14, Persona.TRAVEL: 10, Persona.AGRICULTURE: 8}.get(persona, 6)
     if profile.extra_protection:
         context += min(8, len(profile.extra_protection) * 2)
     factors = [
@@ -37,6 +37,11 @@ def impact_for(profile: UserProfile, weather: Weather) -> Impact:
         _factor("Wind", wind, f"Sustained wind is {weather.wind_speed} km/h"),
         _factor("Air quality", air, f"AQI is {weather.aqi or 'unavailable'}"),
         _factor("Your context", context, f"Ranked for {persona.value.replace('_', ' ')} and selected protection needs"),
+        _factor("Lightning", 10 if weather.lightning_probability >= 30 and outdoor else 0, f"Lightning probability is {weather.lightning_probability}%"),
+        _factor("Flooding", 18 if weather.flood_risk == "high" and persona in {Persona.COMMUTER, Persona.TRAVEL, Persona.FAMILY} else 5 if weather.flood_risk == "moderate" else 0, f"Localized flood risk is {weather.flood_risk}"),
+        _factor("Fog", 12 if weather.fog_probability >= 25 and persona in {Persona.COMMUTER, Persona.TRAVEL} else 0, f"Fog probability is {weather.fog_probability}%"),
+        _factor("Dust", 12 if weather.dust_risk != "low" and persona in {Persona.HEALTH, Persona.OUTDOOR_WORKER} else 0, f"Dust risk is {weather.dust_risk}"),
+        _factor("Cyclone", 22 if weather.cyclone_risk == "warning" else 12 if weather.cyclone_risk == "watch" and persona in {Persona.TRAVEL, Persona.FAMILY, Persona.GENERAL} else 0, f"Cyclone status is {weather.cyclone_risk}"),
     ]
     score = min(100, sum(int(f["contribution"]) for f in factors))
     return Impact(score=score, level=priority(score), factors=factors)
@@ -116,10 +121,28 @@ def recommendations_for(profile: UserProfile, weather: Weather, impact: Impact) 
 
 def alert_for(profile: UserProfile, weather: Weather, impact: Impact) -> Alert:
     persona = profile.persona
+    if weather.cyclone_risk in {"watch", "warning"} and persona in {Persona.TRAVEL, Persona.FAMILY, Persona.GENERAL, Persona.BEACH}:
+        return Alert(title="Coastal weather watch affects your plans", message="A demo cyclone watch is active for this destination scenario.",
+                     severity="Critical" if weather.cyclone_risk == "warning" else "High", source="Demo severe-weather scenario",
+                     actions=["Check the latest official IMD cyclone bulletin", "Avoid making decisions from this demo alone"])
+    if weather.flood_risk == "high" and persona in {Persona.COMMUTER, Persona.TRAVEL, Persona.FAMILY}:
+        return Alert(title="Localized flooding may affect your route", message="Heavy rain may affect low-lying roads in this demo scenario.",
+                     severity="Critical", source="Demo severe-weather scenario", distance_km=3.2, eta_minutes=35,
+                     actions=["Avoid low-lying roads", "Check official local warnings", "Delay travel if conditions worsen"])
     if weather.lightning_probability >= 30 and persona in {Persona.OUTDOOR_WORKER, Persona.FITNESS, Persona.FAMILY}:
         return Alert(title="Severe thunderstorm conditions may approach", message="A demo storm cell may affect outdoor plans.", severity="Critical",
                      source="Demo severe-weather scenario", distance_km=12, eta_minutes=45,
                      actions=["Move indoors", "Avoid open areas", "Check the latest official IMD warning"])
+    if weather.feels_like >= 42 and persona == Persona.OUTDOOR_WORKER:
+        return Alert(title="High heat exposure risk during outdoor work", message="Peak heat overlaps with your outdoor-work profile.",
+                     severity="Critical", source="Mausam+ demo rule",
+                     actions=["Move strenuous work outside peak heat", "Use shaded rest breaks", "Check official heat warnings"])
+    if weather.fog_probability >= 25 and persona in {Persona.COMMUTER, Persona.TRAVEL}:
+        return Alert(title="Reduced visibility may affect travel", message="Fog risk overlaps with your saved travel context.",
+                     severity="High", source="Mausam+ demo rule", actions=["Allow additional travel time", "Use official visibility updates"])
+    if weather.dust_risk != "low" and persona in {Persona.HEALTH, Persona.OUTDOOR_WORKER}:
+        return Alert(title="Dust and poor air quality may feel uncomfortable", message="Environmental conditions are elevated for your selected context.",
+                     severity="High", source="Mausam+ demo rule", actions=["Consider reducing prolonged outdoor exposure"])
     titles = {
         Persona.FITNESS: "Cycling conditions may become difficult",
         Persona.FAMILY: "Outdoor family plans need attention",
