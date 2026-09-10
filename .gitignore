@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env
+__pycache__/
+.venv/
+.pytest_cache/
+.stitch-reference/
+*.pyc
+mausam_plus.db
+*.log
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
