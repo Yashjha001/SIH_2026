@@ -1,184 +1,244 @@
+"""Versioned, explainable planning model. Scores are heuristics, not probabilities."""
 from __future__ import annotations
 
-from .schemas import Alert, CommunityObservation, Feed, Impact, Persona, Recommendation, UserProfile, Weather
+from datetime import datetime, timedelta
+from hashlib import sha256
+
+from .schemas import Alert, Feed, Impact, Persona, Recommendation, UserProfile, Weather
+
+MODEL_VERSION = "mausam-rules-2.0"
+SUBJECTS = {
+    "fitness": "outdoor exercise", "family": "family outdoor plans", "agriculture": "field work",
+    "travel": "travel", "health": "outdoor exposure", "commuter": "your commute",
+    "outdoor_worker": "outdoor work", "event": "your outdoor event", "general": "your daily plans",
+    "beach": "coastal outdoor plans",
+}
+ACTIONS = {
+    "Temperature": "Reduce strenuous exposure and plan shaded breaks",
+    "Rain": "Carry rain protection and keep a covered alternative",
+    "UV": "Use shade and sun protection during the indicated period",
+    "Air quality": "Consider reducing prolonged outdoor exertion",
+    "Humidity": "Allow more rest time during warm, humid outdoor activity",
+    "Wind": "Secure loose items and reassess exposed outdoor activity",
+    "Visibility": "Allow extra travel time and check local travel conditions",
+    "Lightning": "Move into a substantial building if thunder is heard",
+    "Flooding": "Avoid flooded roads and follow local official instructions",
+    "Fog": "Allow extra travel time in reduced visibility",
+    "Dust": "Reduce exposure to blowing dust and check air-quality updates",
+    "Cyclone": "Follow the official cyclone bulletin and local instructions",
+}
 
 
 def priority(score: int) -> str:
-    if score >= 81:
-        return "Critical"
-    if score >= 61:
-        return "High"
-    if score >= 31:
-        return "Moderate"
-    return "Low"
+    return "Critical" if score >= 85 else "High" if score >= 60 else "Moderate" if score >= 30 else "Low"
 
 
-def _factor(name: str, contribution: int, explanation: str) -> dict[str, str | int]:
-    status = "High" if contribution >= 18 else "Moderate" if contribution >= 8 else "Low"
-    return {"name": name, "status": status, "contribution": contribution, "explanation": explanation}
+def context_weights(profile: UserProfile) -> dict[str, float]:
+    weights = dict.fromkeys(ACTIONS, 1.0)
+    selected = {
+        Persona.FITNESS: ("Temperature", "UV", "Wind"),
+        Persona.FAMILY: ("Temperature", "UV", "Rain"),
+        Persona.AGRICULTURE: ("Rain", "Wind", "Humidity"),
+        Persona.TRAVEL: ("Rain", "Visibility", "Fog"),
+        Persona.COMMUTER: ("Rain", "Visibility", "Wind"),
+        Persona.OUTDOOR_WORKER: ("Temperature", "Humidity", "Lightning"),
+        Persona.HEALTH: ("Air quality", "Dust", "Temperature"),
+        Persona.EVENT: ("Rain", "Wind", "Temperature"),
+        Persona.BEACH: ("Wind", "Cyclone", "Lightning"),
+    }.get(profile.persona, ())
+    for name in selected:
+        weights[name] += .35
+    # Match meaning, never increase risk just because more preferences were entered.
+    activity_map = {
+        "cycling": ("Wind", "Temperature"), "walking": ("UV", "Temperature"),
+        "school commute": ("Rain", "Visibility"), "farming": ("Rain", "Wind"),
+        "gardening": ("UV", "Rain"), "outdoor work": ("Temperature", "Humidity"),
+        "travel": ("Rain", "Visibility"), "outdoor events": ("Rain", "Wind"),
+    }
+    for name in {factor for item in profile.activities for factor in activity_map.get(item.casefold(), ())}:
+        weights[name] += .15
+    if profile.extra_protection:
+        for name in ("Temperature", "Air quality", "UV"):
+            weights[name] += .2
+    return weights
+
+
+def measurements(weather: Weather) -> dict[str, tuple[int, str]]:
+    w = weather
+    # Bounded planning thresholds; unavailable official hazards receive no invented evidence.
+    scale = lambda value, start, width: max(0, min(100, round((value - start) / width * 100)))
+    result = {
+        "Temperature": (max(scale(w.feels_like, 28, 17), scale(5 - w.temperature, 0, 20)), f"Feels like {w.feels_like}°C; temperature {w.temperature}°C"),
+        "Rain": (scale(w.rain_probability, 20, 70), f"Rain probability {w.rain_probability}%"),
+        "UV": (scale(w.uv_index, 2, 9), f"UV index {w.uv_index}"),
+        "Air quality": (scale(w.aqi, 50, 150) if w.aqi is not None else 0, f"US AQI {w.aqi}" if w.aqi is not None else "AQI unavailable"),
+        "Humidity": (scale(w.humidity, 65, 30) if w.feels_like >= 30 else 0, f"Humidity {w.humidity}% with feels-like {w.feels_like}°C"),
+        "Wind": (scale(w.wind_speed, 15, 45), f"Wind {w.wind_speed} km/h"),
+        "Visibility": (scale(5 - w.visibility, 0, 5), f"Visibility {w.visibility} km"),
+        "Lightning": (90 if w.thunderstorm else 0, "Thunderstorm weather code present" if w.thunderstorm else "No thunderstorm signal in this snapshot; lightning probability unavailable"),
+        "Flooding": (0, "Official flood assessment unavailable"),
+        "Fog": (65 if "fog" in w.condition.casefold() else 0, f"Condition: {w.condition}"),
+        "Dust": (45 if w.dust_risk == "moderate" else 0, f"Dust indicator: {w.dust_risk}"),
+        "Cyclone": (0, "Official cyclone assessment unavailable"),
+    }
+    if w.severe_data_available:
+        result["Flooding"] = (90 if w.flood_risk == "high" else 40 if w.flood_risk == "moderate" else 0, f"Source flood risk: {w.flood_risk}")
+        result["Cyclone"] = (100 if w.cyclone_risk == "warning" else 65 if w.cyclone_risk == "watch" else 0, f"Source cyclone status: {w.cyclone_risk}")
+    return result
 
 
 def impact_for(profile: UserProfile, weather: Weather) -> Impact:
-    persona = profile.persona
-    outdoor = persona in {Persona.FITNESS, Persona.FAMILY, Persona.OUTDOOR_WORKER, Persona.EVENT}
-    heat = 25 if weather.feels_like >= 42 and outdoor else 18 if weather.feels_like >= 36 and outdoor else 6
-    uv = 18 if weather.uv_index >= 8 and outdoor else 8 if weather.uv_index >= 6 else 2
-    rain_weight = 16 if persona in {Persona.COMMUTER, Persona.TRAVEL, Persona.FAMILY} else 6 if persona == Persona.AGRICULTURE else 5
-    rain = rain_weight if weather.rain_probability >= 60 else 4
-    wind = 10 if weather.wind_speed >= 25 and persona == Persona.FITNESS else 8 if weather.wind_speed >= 25 and persona in {Persona.OUTDOOR_WORKER, Persona.EVENT, Persona.AGRICULTURE} else 5
-    air = 18 if (weather.aqi or 0) >= 200 and persona in {Persona.HEALTH, Persona.OUTDOOR_WORKER} else 10 if (weather.aqi or 0) >= 120 else 2
-    context = {Persona.OUTDOOR_WORKER: 22, Persona.FITNESS: 12, Persona.FAMILY: 12, Persona.COMMUTER: 14, Persona.TRAVEL: 10, Persona.AGRICULTURE: 8}.get(persona, 6)
-    if profile.extra_protection:
-        context += min(8, len(profile.extra_protection) * 2)
-    factors = [
-        _factor("Temperature", heat, f"Feels like {weather.feels_like}°C during the warmest period"),
-        _factor("UV", uv, f"UV index reaches {weather.uv_index}"),
-        _factor("Rain", rain, f"Rain probability is {weather.rain_probability}%"),
-        _factor("Wind", wind, f"Sustained wind is {weather.wind_speed} km/h"),
-        _factor("Air quality", air, f"AQI is {weather.aqi or 'unavailable'}"),
-        _factor("Your context", context, f"Ranked for {persona.value.replace('_', ' ')} and selected protection needs"),
-        _factor("Lightning", 10 if weather.lightning_probability >= 30 and outdoor else 0, f"Lightning probability is {weather.lightning_probability}%"),
-        _factor("Flooding", 18 if weather.flood_risk == "high" and persona in {Persona.COMMUTER, Persona.TRAVEL, Persona.FAMILY} else 5 if weather.flood_risk == "moderate" else 0, f"Localized flood risk is {weather.flood_risk}"),
-        _factor("Fog", 12 if weather.fog_probability >= 25 and persona in {Persona.COMMUTER, Persona.TRAVEL} else 0, f"Fog probability is {weather.fog_probability}%"),
-        _factor("Dust", 12 if weather.dust_risk != "low" and persona in {Persona.HEALTH, Persona.OUTDOOR_WORKER} else 0, f"Dust risk is {weather.dust_risk}"),
-        _factor("Cyclone", 22 if weather.cyclone_risk == "warning" else 12 if weather.cyclone_risk == "watch" and persona in {Persona.TRAVEL, Persona.FAMILY, Persona.GENERAL} else 0, f"Cyclone status is {weather.cyclone_risk}"),
-    ]
-    score = min(100, sum(int(f["contribution"]) for f in factors))
+    weights = context_weights(profile)
+    values = measurements(weather)
+    # Independent contributions sum exactly to the displayed capped score.
+    contributions = {name: round(severity * weights[name] / 5) for name, (severity, _) in values.items()}
+    total = sum(contributions.values())
+    if total > 100:
+        scaled = {name: int(value * 100 / total) for name, value in contributions.items()}
+        for name in sorted(contributions, key=contributions.get, reverse=True)[:100-sum(scaled.values())]:
+            scaled[name] += 1
+        contributions = scaled
+    factors = [{"name": name, "status": priority(raw), "contribution": contributions[name],
+                "explanation": f"{detail}; relevance multiplier {weights[name]:.2f} for {profile.persona.value.replace('_', ' ')}"}
+               for name, (raw, detail) in values.items()]
+    factors.sort(key=lambda f: f["contribution"], reverse=True)
+    score = sum(contributions.values())
     return Impact(score=score, level=priority(score), factors=factors)
 
 
-def _rec(id: str, type: str, title: str, message: str, score: int, reasons: list[str], action: str, badge: str) -> Recommendation:
-    return Recommendation(id=id, type=type, title=title, message=message, priority=priority(score), score=score,
-                          reason=reasons, action=action, badge=badge)
+def _snapshot(base: Weather, row: dict) -> Weather:
+    updates = {}
+    for key, field in {"temp": "temperature", "feels_like": "feels_like", "humidity": "humidity",
+                       "rain": "rain_probability", "wind": "wind_speed", "uv": "uv_index",
+                       "visibility": "visibility"}.items():
+        if row.get(key) is not None:
+            updates[field] = row[key]
+    # AQI remains explicitly the current-context reading, not an hourly prediction.
+    code = row.get("weather_code")
+    if code is not None:
+        updates.update(thunderstorm=code in (95, 96, 99), condition=str(row.get("event", base.condition)))
+    return base.model_copy(update=updates)
+
+
+def _periods(weather: Weather, hourly: list[dict]) -> list[tuple[Weather, str, float, dict]]:
+    periods = [(weather, "Current conditions", 0.0, {})]
+    for row in hourly:
+        if "timestamp" not in row:
+            continue
+        hours = float(row.get("hours_ahead", 0))
+        if not 0 <= hours <= 24:
+            continue
+        periods.append((_snapshot(weather, row), str(row["time"]), hours, row))
+    return periods
+
+
+def _routine_overlap(profile: UserProfile, row: dict) -> bool:
+    if not profile.commute_time or not row.get("timestamp"):
+        return False
+    try:
+        routine = datetime.strptime(profile.commute_time, "%H:%M")
+        stamp = datetime.fromisoformat(str(row["timestamp"]))
+        return abs((stamp.hour * 60 + stamp.minute) - (routine.hour * 60 + routine.minute)) <= 60
+    except ValueError:
+        return False
+
+
+def evaluate(profile: UserProfile, weather: Weather, hourly: list[dict]) -> tuple[Impact, list[Recommendation], list[Alert]]:
+    periods = _periods(weather, hourly)
+    weights = context_weights(profile)
+    subject = SUBJECTS[profile.persona.value]
+    context = f"Your context: {subject}; activities: {', '.join(profile.activities) or 'none selected'}"
+    if profile.extra_protection:
+        context += "; protection: " + ", ".join(profile.extra_protection)
+    if profile.routine:
+        context += "; daily needs: " + profile.routine
+    if profile.commute_time:
+        context += f"; departure {profile.commute_time}"
+    candidates = []
+    alerts = []
+    for hazard in ACTIONS:
+        scored = []
+        for snapshot, label, hours, row in periods:
+            raw, detail = measurements(snapshot)[hazard]
+            timing = 1 if hours <= 6 else .85
+            overlap = _routine_overlap(profile, row)
+            relevance = weights[hazard] + (.2 if overlap else 0)
+            rank = min(100, round(raw * relevance * timing))
+            scored.append((rank, raw, detail, label, hours, overlap))
+        rank, raw, detail, label, hours, overlap = max(scored, key=lambda x: x[0])
+        if raw < 25:
+            continue
+        reasons = [detail, context, f"{weather.location}: {label}; forecast horizon {round(hours)}h",
+                   f"Priority {rank}/100 = condition {raw} × relevance {weights[hazard] + (.2 if overlap else 0):.2f} × timing {1 if hours <= 6 else .85} (capped)"]
+        if overlap:
+            reasons.append(f"Forecast overlaps your {profile.commute_time} departure")
+        slug = hazard.lower().replace(" ", "-")
+        action = ACTIONS[hazard]
+        if hazard == "Rain" and profile.persona == Persona.AGRICULTURE:
+            action = "Review field-work timing; use an official agromet advisory for irrigation decisions"
+        if hazard == "Wind" and profile.persona == Persona.FITNESS:
+            action = "Reassess exposed cycling routes and choose a sheltered alternative"
+        candidates.append(Recommendation(id=slug, type=profile.persona.value,
+            title=f"{hazard} planning for {subject}", message=f"{label} in {weather.location}: {detail.lower()}.",
+            priority=priority(rank), score=rank, reason=reasons, action=action, badge="Preventive guidance"))
+        if raw >= 45:
+            # Stable within a local forecast day: refreshes do not generate duplicate notifications.
+            day = next((str(row.get("timestamp", ""))[:10] for _, _, _, row in periods if row.get("timestamp")), datetime.now().date().isoformat())
+            alert_id = sha256(f"{weather.location.casefold()}:{hazard}:{priority(raw)}:{day}".encode()).hexdigest()[:20]
+            demo = "demo" in weather.source.casefold()
+            alerts.append(Alert(id=alert_id, title=f"{hazard}: {subject}", message=f"{detail}. {label} in {weather.location}.",
+                severity=priority(raw), source="Demo scenario" if demo else "Mausam+ generated guidance",
+                source_type="demo" if demo else "generated", actions=[action], reason=reasons, rank=rank,
+                location=weather.location, valid_at=label,
+                notification_eligible=profile.notifications_enabled and not demo and raw >= 60 and rank >= 60 and hours <= 6))
+    # Select a future, daylight interval using the same weighted risks.
+    windows = [(snapshot, label, row) for snapshot, label, hours, row in periods if row and row.get("is_day") == 1 and hours >= 0]
+    if windows:
+        best, label, row = min(windows, key=lambda item: max(raw * weights[name] for name, (raw, _) in measurements(item[0]).items()))
+        worst = max(raw * weights[name] for name, (raw, _) in measurements(best).items())
+        suitable = worst < 60
+        window_reason = [context, f"Compared {len(windows)} upcoming daylight forecast hours using the same risk factors",
+            f"{label}: feels like {best.feels_like}°C, rain {best.rain_probability}%, UV {best.uv_index}, wind {best.wind_speed} km/h",
+            "Relative planning guidance; conditions can change"]
+        candidates.append(Recommendation(id="activity-window", type=profile.persona.value,
+            title=f"{'Lower-exposure period' if suitable else 'No low-risk period found'} for {subject}",
+            message=f"{label} has the lowest combined exposure among the available daylight forecast hours.",
+            priority="Low" if suitable else "Moderate", score=25 if suitable else 50, reason=window_reason,
+            action=f"Consider {label} for {subject}" if suitable else "Keep a sheltered alternative; even the best interval has elevated exposure",
+            badge="Activity timing"))
+    if not candidates:
+        candidates.append(Recommendation(id="routine", type=profile.persona.value, title=f"Briefing for {subject}",
+            message=f"No elevated planning thresholds in the available data for {weather.location}.",
+            priority="Low", score=0, reason=[context, "Available temperature, rain, UV, air quality, humidity, wind and visibility thresholds checked"],
+            action="Check the forecast again before your activity", badge="Daily guidance"))
+    # A data-gap action is always available; it never claims an official warning.
+    candidates.append(Recommendation(id="source-check", type=profile.persona.value, title="Check official severe-weather warnings",
+        message="Official IMD warnings are not connected to this deployment.",
+        priority="Low", score=0, reason=[weather.source, "Flood, cyclone, and lightning probabilities cannot be inferred from rain probability"],
+        action="Consult the latest IMD bulletin before weather-sensitive decisions", badge="Source status"))
+    candidates.sort(key=lambda item: item.score, reverse=True)
+    alerts.sort(key=lambda item: ({"Critical": 3, "High": 2, "Moderate": 1, "Low": 0}[item.severity], item.rank), reverse=True)
+    return impact_for(profile, weather), candidates[:3], alerts
 
 
 def recommendations_for(profile: UserProfile, weather: Weather, impact: Impact) -> list[Recommendation]:
-    p, score = profile.persona, impact.score
-    options: dict[Persona, list[Recommendation]] = {
-        Persona.FITNESS: [
-            _rec("fitness-window", "fitness", "Good morning for cycling", "Best window: 6:00–8:00 AM", score,
-                 ["Lower temperature early morning", "UV rises after 10 AM", "Strong wind develops later"], "Plan your ride before 8 AM", "Best time"),
-            _rec("fitness-heat", "fitness", "Avoid strenuous activity at midday", "Heat and UV peak between 11 AM–4 PM", score-5,
-                 ["High feels-like temperature", "UV index is high"], "Choose shade or an indoor workout", "Preventive action"),
-            _rec("fitness-rain", "fitness", "Rain may affect the evening session", "The likely rain window begins after 6 PM", score-12,
-                 [f"Rain probability is {weather.rain_probability}%"], "Keep an indoor alternative ready", "Plan ahead"),
-        ],
-        Persona.FAMILY: [
-            _rec("family-heat", "family", "Afternoon heat makes outdoor conditions uncomfortable", "Heat and UV rise after 11 AM", score,
-                 ["Children are included in your protection preferences", "Feels-like temperature is elevated", "UV is high"], "Choose indoor activities after 11 AM", "Family alert"),
-            _rec("family-commute", "family", "Rain may overlap with school travel", "Showers are most likely around the evening commute", score-5,
-                 [f"Rain probability is {weather.rain_probability}%", "The rain window overlaps common pickup times"], "Carry rain protection for pickup", "School commute"),
-            _rec("family-window", "family", "Earlier outdoor time is more comfortable", "The best family window is 7:00–9:00 AM", score-10,
-                 ["Lower morning heat", "Lower morning UV"], "Move outdoor play to the morning", "Best time"),
-        ],
-        Persona.AGRICULTURE: [
-            _rec("farm-rain", "agriculture", "Rain expected later today", "Review weather-dependent field activities", score,
-                 [f"Rain probability is {weather.rain_probability}%", f"Wind reaches {weather.wind_speed} km/h"], "Review irrigation plans before rainfall", "Demo recommendation"),
-            _rec("farm-wind", "agriculture", "Wind may affect exposed work", "Stronger afternoon winds reduce the suitable field window", score-5,
-                 ["Wind exceeds the demo planning threshold"], "Check an official agrometeorological advisory before acting", "Demo rule"),
-            _rec("farm-source", "agriculture", "Official advisory should guide crop decisions", "Mausam+ can surface approved Meghdoot or IMD guidance when connected", 25,
-                 ["No verified agronomic advisory provider is connected in this prototype"], "Use this demo as weather context only", "Source transparency"),
-        ],
-        Persona.TRAVEL: [
-            _rec("travel-pack", "travel", "Pack for a changeable evening", "Rain may affect destination plans", score,
-                 [f"Rain probability is {weather.rain_probability}%", "The rain window begins in the evening"], "Carry rain protection", "Destination advice"),
-            _rec("travel-window", "travel", "Complete outdoor plans earlier", "Conditions are more predictable before 4 PM", score-5,
-                 ["Rain and wind increase later"], "Keep evening plans flexible", "Best time"),
-            _rec("travel-visibility", "travel", "Check visibility before departure", f"Current visibility is {weather.visibility} km", score-12,
-                 ["Visibility can change during showers"], "Review official warnings before travel", "Travel check"),
-        ],
-        Persona.COMMUTER: [
-            _rec("commute-window", "commuter", "Rain may affect your evening commute", "Your usual route overlaps the likely rain window", score,
-                 [f"Rain probability is {weather.rain_probability}%", f"Saved commute time is {profile.commute_time or '5:30 PM'}"], "Travel before 4:30 PM where possible", "Smart commute"),
-            _rec("commute-two-wheeler", "commuter", "Two-wheeler conditions may become risky", "Rain and stronger wind are expected later", score-4,
-                 ["Wet-road and crosswind conditions may overlap"], "Keep an alternate travel option ready", "Ride alert"),
-            _rec("commute-visibility", "commuter", "Visibility check", f"Visibility is {weather.visibility} km", score-14,
-                 ["Rain can reduce local visibility"], "Allow additional travel time", "Route context"),
-        ],
-        Persona.OUTDOOR_WORKER: [
-            _rec("worker-heat", "outdoor_worker", "Heat exposure risk increases from 12–4 PM", "Strenuous outdoor work becomes less suitable at midday", score,
-                 [f"Feels like {weather.feels_like}°C", f"UV index is {weather.uv_index}", "Outdoor work increases exposure"], "Schedule a shaded break from 1–2 PM", "Work-risk alert"),
-            _rec("worker-rain", "outdoor_worker", "Work disruption is possible this evening", "Rain and wind increase after 4:30 PM", score-5,
-                 ["Rain and wind overlap outdoor tasks"], "Secure loose equipment and finish exposed work earlier", "Preventive action"),
-            _rec("worker-lightning", "outdoor_worker", "Watch for lightning updates", f"Demo lightning probability is {weather.lightning_probability}%", score-10,
-                 ["Outdoor profiles receive earlier lightning escalation"], "Move indoors if an official warning is issued", "Safety watch"),
-        ],
-        Persona.EVENT: [
-            _rec("event-window", "event", "Outdoor event suitability is moderate", "Heat and UV may reduce attendee comfort", score,
-                 ["Peak heat occurs in the afternoon", "Rain is possible later"], "Prefer a start time after 5:30 PM with a rain backup", "Event window"),
-        ],
-        Persona.HEALTH: [
-            _rec("health-environment", "health", "Outdoor conditions may feel uncomfortable", "Heat, UV and air quality are elevated", score,
-                 [f"AQI is {weather.aqi}", f"UV index is {weather.uv_index}"], "Consider reducing prolonged outdoor exposure", "Environmental context"),
-        ],
-        Persona.GENERAL: [
-            _rec("general-action", "general", "Plan strenuous outdoor activity earlier", "Heat, UV and wind rise later today", score,
-                 ["Morning conditions are more comfortable"], "Use the 6:00–8:00 AM window", "Today’s action"),
-        ],
-    }
-    return sorted(options.get(p, options[Persona.GENERAL]), key=lambda item: item.score, reverse=True)[:3]
+    return evaluate(profile, weather, [])[1]
 
 
-def alert_for(profile: UserProfile, weather: Weather, impact: Impact) -> Alert:
-    persona = profile.persona
-    if weather.cyclone_risk in {"watch", "warning"} and persona in {Persona.TRAVEL, Persona.FAMILY, Persona.GENERAL, Persona.BEACH}:
-        return Alert(title="Coastal weather watch affects your plans", message="A demo cyclone watch is active for this destination scenario.",
-                     severity="Critical" if weather.cyclone_risk == "warning" else "High", source="Demo severe-weather scenario",
-                     actions=["Check the latest official IMD cyclone bulletin", "Avoid making decisions from this demo alone"])
-    if weather.flood_risk == "high" and persona in {Persona.COMMUTER, Persona.TRAVEL, Persona.FAMILY}:
-        return Alert(title="Localized flooding may affect your route", message="Heavy rain may affect low-lying roads in this demo scenario.",
-                     severity="Critical", source="Demo severe-weather scenario", distance_km=3.2, eta_minutes=35,
-                     actions=["Avoid low-lying roads", "Check official local warnings", "Delay travel if conditions worsen"])
-    if weather.lightning_probability >= 30 and persona in {Persona.OUTDOOR_WORKER, Persona.FITNESS, Persona.FAMILY}:
-        return Alert(title="Severe thunderstorm conditions may approach", message="A demo storm cell may affect outdoor plans.", severity="Critical",
-                     source="Demo severe-weather scenario", distance_km=12, eta_minutes=45,
-                     actions=["Move indoors", "Avoid open areas", "Check the latest official IMD warning"])
-    if weather.feels_like >= 42 and persona == Persona.OUTDOOR_WORKER:
-        return Alert(title="High heat exposure risk during outdoor work", message="Peak heat overlaps with your outdoor-work profile.",
-                     severity="Critical", source="Mausam+ demo rule",
-                     actions=["Move strenuous work outside peak heat", "Use shaded rest breaks", "Check official heat warnings"])
-    if weather.fog_probability >= 25 and persona in {Persona.COMMUTER, Persona.TRAVEL}:
-        return Alert(title="Reduced visibility may affect travel", message="Fog risk overlaps with your saved travel context.",
-                     severity="High", source="Mausam+ demo rule", actions=["Allow additional travel time", "Use official visibility updates"])
-    if weather.dust_risk != "low" and persona in {Persona.HEALTH, Persona.OUTDOOR_WORKER}:
-        return Alert(title="Dust and poor air quality may feel uncomfortable", message="Environmental conditions are elevated for your selected context.",
-                     severity="High", source="Mausam+ demo rule", actions=["Consider reducing prolonged outdoor exposure"])
-    titles = {
-        Persona.FITNESS: "Cycling conditions may become difficult",
-        Persona.FAMILY: "Outdoor family plans need attention",
-        Persona.AGRICULTURE: "Rain and wind planning alert",
-        Persona.TRAVEL: "Destination weather may affect plans",
-        Persona.COMMUTER: "Evening commute disruption possible",
-        Persona.OUTDOOR_WORKER: "Heat and wind work-risk alert",
-    }
-    return Alert(title=titles.get(persona, "Weather conditions need attention"),
-                 message="Strong wind, heat and the evening rain window overlap with your selected context.",
-                 severity=impact.level, source="Mausam+ demo rule", actions=[recommendations_for(profile, weather, impact)[0].action])
-
-
-def build_feed(profile: UserProfile, weather: Weather) -> Feed:
-    impact = impact_for(profile, weather)
-    recommendations = recommendations_for(profile, weather, impact)
-    alert = alert_for(profile, weather, impact)
-    hourly = [
-        {"time":"6 AM","icon":"☀️","temp":25,"event":"Safer window"}, {"time":"9 AM","icon":"🌤️","temp":29,"event":"UV rising"},
-        {"time":"12 PM","icon":"☀️","temp":33,"event":"Peak heat"}, {"time":"3 PM","icon":"💨","temp":34,"event":"Strong wind"},
-        {"time":"6 PM","icon":"🌧️","temp":30,"event":"Rain window"},
-    ]
-    daily = [
-        {"day":"Today","icon":"🌤️","high":weather.temperature,"low":25,"rain":weather.rain_probability},
-        {"day":"Thu","icon":"🌧️","high":31,"low":24,"rain":75}, {"day":"Fri","icon":"🌤️","high":32,"low":25,"rain":35},
-        {"day":"Sat","icon":"☀️","high":34,"low":26,"rain":15},
-    ]
-    observations = [CommunityObservation(id="obs-water-1", type="waterlogging", location="Near SG Highway", distance_km=1.8,
-                                         reported_at="12 minutes ago", count=7)]
-    return Feed(location={"name":profile.location,"label":"Active location"}, weather=weather, impact=impact,
-                cards=recommendations, recommendations=recommendations, alerts=[alert],
-                explanation={"title":"Why am I seeing this?","items":[f"You selected {profile.persona.value.replace('_',' ').title()}", *recommendations[0].reason],
-                             "summary":"Weather, time, location and your context determine this priority."},
-                hourly=hourly, daily=daily, observations=observations)
+def build_feed(profile: UserProfile, weather: Weather, hourly_data: list[dict] | None = None,
+               daily_data: list[dict] | None = None) -> Feed:
+    hourly, daily = hourly_data or [], daily_data or []
+    impact, recs, alerts = evaluate(profile, weather, hourly)
+    gaps = ["Official IMD warnings are not connected; flood and cyclone assessments unavailable."]
+    if weather.aqi is None:
+        gaps.append("AQI is unavailable for this update.")
+    return Feed(location={"name": weather.location, "label": "Active location"}, weather=weather, impact=impact,
+        cards=recs, recommendations=recs, alerts=alerts, notifications=[a for a in alerts if a.notification_eligible],
+        notifications_enabled=profile.notifications_enabled, model_version=MODEL_VERSION, data_gaps=gaps,
+        explanation={"title": "Why am I seeing this?", "items": recs[0].reason,
+                     "summary": "Measured conditions × persona and activity relevance × timing determine priority."},
+        hourly=hourly, daily=daily, observations=[], is_demo_data="demo" in weather.source.lower(), provider=weather.source)
 
 
 def recommendation(persona: Persona, weather: Weather) -> Recommendation:
-    profile = UserProfile(persona=persona)
-    return recommendations_for(profile, weather, impact_for(profile, weather))[0]
+    return evaluate(UserProfile(persona=persona), weather, [])[1][0]
