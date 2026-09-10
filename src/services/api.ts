@@ -7,3 +7,9 @@ export async function getFeed(persona: Persona, location: string): Promise<Feed>
   if (!response.ok) throw new Error("Weather data is temporarily unavailable.");
   return response.json() as Promise<Feed>;
 }
+
+export async function reportObservation(type: string, location: string) {
+  const response = await fetch("/api/community/observations", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({type, location})});
+  if (!response.ok) throw new Error("Could not submit the observation.");
+  return response.json();
+}

@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 .pytest_cache/
 .stitch-reference/
+.git_saved/
 *.pyc
 mausam_plus.db
 *.log

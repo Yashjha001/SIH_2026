@@ -4,13 +4,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from .engine import build_feed
 from .providers import MockWeatherProvider
-from .schemas import LocationInput, Persona, UserProfile
+from .schemas import CommunityObservation, LocationInput, ObservationInput, Persona, UserProfile
 
 app = FastAPI(title="Mausam+ API", version="0.1.0", description="Transparent demo weather personalization API")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 provider = MockWeatherProvider()
 profiles: dict[str, UserProfile] = {"demo-user": UserProfile()}
 locations: dict[str, list[dict[str, str]]] = {"demo-user": [{"id": "home", "name": "Ahmedabad", "label": "Home"}, {"id": "travel", "name": "Mumbai", "label": "Destination"}]}
+community_observations: list[CommunityObservation] = []
 
 def profile_for(user_id: str) -> UserProfile:
     if user_id not in profiles: raise HTTPException(404, "User not found")
@@ -31,6 +32,10 @@ def hourly_weather(location: str = "Ahmedabad"):
 def daily_weather(location: str = "Ahmedabad"):
     return build_feed(UserProfile(location=location), provider.current(location)).daily
 
+@app.get("/api/weather/alerts")
+def weather_alerts(location: str = "Ahmedabad", persona: Persona = Persona.GENERAL):
+    return build_feed(UserProfile(location=location, persona=persona), provider.current(location)).alerts
+
 @app.get("/api/users/{user_id}")
 def get_user(user_id: str) -> UserProfile: return profile_for(user_id)
 
@@ -39,6 +44,17 @@ def update_user(user_id: str, profile: UserProfile) -> UserProfile:
     if profile.id != user_id: raise HTTPException(400, "Profile id must match URL")
     profiles[user_id] = profile
     return profile
+
+@app.get("/api/users/{user_id}/preferences")
+def get_preferences(user_id: str):
+    profile = profile_for(user_id)
+    return {"activities": profile.activities, "extra_protection": profile.extra_protection,
+            "notifications_enabled": profile.notifications_enabled, "commute_time": profile.commute_time,
+            "routine": profile.routine}
+
+@app.put("/api/users/{user_id}/preferences")
+def update_preferences(user_id: str, profile: UserProfile):
+    return update_user(user_id, profile)
 
 @app.get("/api/users/{user_id}/personalized-feed")
 def feed(user_id: str, persona: Persona | None = None, location: str | None = None):
@@ -76,3 +92,15 @@ def scenarios(): return [{"id": p.value, "label": p.value.title()} for p in [Per
 def select_scenario(scenario_id: Persona):
     profiles["demo-user"] = profiles["demo-user"].model_copy(update={"persona": scenario_id})
     return feed("demo-user")
+
+@app.get("/api/community/observations")
+def observations(location: str = "Ahmedabad"):
+    defaults = build_feed(UserProfile(location=location), provider.current(location)).observations
+    return [*community_observations, *defaults]
+
+@app.post("/api/community/observations", status_code=201)
+def report_observation(item: ObservationInput):
+    observation = CommunityObservation(id=f"community-{len(community_observations)+1}", type=item.type,
+        location=item.location, distance_km=0.5, reported_at="just now")
+    community_observations.insert(0, observation)
+    return observation

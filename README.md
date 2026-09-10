@@ -5,10 +5,12 @@
 ## What is included
 
 - Responsive React + TypeScript application with a polished landing page and personalized dashboard.
-- Instant demo switcher for Fitness, Family, Agriculture/Gardening, and Traveler contexts.
+- Guided onboarding for location, persona, activities, routine, and optional protection needs.
+- Deep demo switcher for Fitness, Family, Agriculture/Gardening, and Traveler contexts, plus working Commuter, Outdoor Worker, Health, Events, and General profiles.
 - FastAPI REST API with Pydantic validation and automatic OpenAPI documentation.
 - Configurable mock weather provider; all data is visibly labelled as demo data.
-- Deterministic, explainable recommendation and alert rules. No medical claims or fabricated official advisories.
+- Deterministic, explainable recommendation and alert rules with visible factor contributions. No medical claims or fabricated official advisories.
+- Three ranked preventive actions, routine-aware commute guidance, severe-event distance/arrival context, and clearly separated community observations.
 - Current conditions, hourly timeline, daily outlook, impact heuristic, transparent explanations, and location switching.
 
 ## Architecture
@@ -60,10 +62,11 @@ npm run build
 - `GET/PUT /api/users/{id}`
 - `GET/POST /api/users/{id}/locations`
 - `GET /api/demo/scenarios` and `POST /api/demo/scenarios/{scenario_id}`
+- `GET/POST /api/community/observations`
 
 ## Personalization engine
 
-The engine uses deterministic MVP heuristics. It combines persona relevance with temperature/UV, rain probability, and wind, then returns a prioritised recommendation, impact score, alert, and a human-readable explanation. The score is a **Personalized Weather Impact** heuristic, not an official weather, health, or safety classification.
+The engine uses deterministic MVP heuristics. It combines persona relevance and protection preferences with temperature, UV, rain, wind, air quality, location, and routine. It returns three ranked actions, a factor-by-factor impact score, a relevant alert, and a human-readable explanation. The score is a **Personalized Weather Impact** heuristic, not an official weather, health, or safety classification.
 
 ## Limitations and next steps
 
