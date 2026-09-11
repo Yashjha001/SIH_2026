@@ -45,6 +45,22 @@ npm run dev
 
 Open `http://localhost:5173`. API documentation is at `http://127.0.0.1:8000/docs`.
 
+## Deploy to Vercel and Render
+
+1. Create a Render **Web Service** from this repository. The included `render.yaml` can be used as a Blueprint, or configure these values manually:
+    - Root directory: `backend`
+    - Build command: `pip install -r requirements.txt`
+    - Start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+    - Health check path: `/api/health`
+2. Copy the Render service URL, for example `https://mausam-plus-api.onrender.com`.
+3. Import the repository into Vercel. The included `vercel.json` configures `npm ci`, `npm run build`, the `dist` output, and SPA routing.
+4. Add this Vercel environment variable for **Production** (and Preview if needed):
+    - `VITE_API_URL=https://mausam-plus-api.onrender.com`
+5. Set the Render environment variable `CORS_ORIGINS` to the Vercel deployment URL, for example `https://mausam-plus.vercel.app`. For multiple origins, separate URLs with commas.
+6. Redeploy both services after saving the environment variables, then verify `/api/health` on Render and the Vercel site.
+
+The frontend uses the local Vite proxy when `VITE_API_URL` is unset, so local development remains unchanged.
+
 ## Testing and production build
 
 ```powershell
